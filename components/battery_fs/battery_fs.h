@@ -89,6 +89,26 @@ esp_err_t battery_fs_write_data(const char *battery_serial, const battery_data_t
 esp_err_t battery_fs_write_bulk(const char *battery_serial, const battery_data_t *data_array, size_t count);
 
 /**
+ * @brief Smart sync: Write only new/changed entries by comparing with existing data
+ * 
+ * Compares incoming ring buffer data against the last N entries in flash.
+ * Only writes entries that don't exist or have changed data (based on CRC32 hash).
+ * This prevents duplicate writes and handles ring buffer wraparound automatically.
+ * 
+ * Process:
+ * 1. Loads last N entries from flash (where N = count of incoming data)
+ * 2. Compares log_number and CRC32 hash of each incoming entry
+ * 3. Writes only new or modified entries
+ * 
+ * @param battery_serial Battery serial number (will be used as filename)
+ * @param data_array Array of battery data structures from ring buffer
+ * @param count Number of entries in the array
+ * @param written_count Pointer to store number of entries actually written (optional, can be NULL)
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t battery_fs_sync_from_ring(const char *battery_serial, const battery_data_t *data_array, size_t count, size_t *written_count);
+
+/**
  * @brief Check if a battery file exists
  * 
  * @param battery_serial Battery serial number
@@ -145,6 +165,16 @@ esp_err_t battery_fs_read_bulk(const char *battery_serial, battery_data_t *data_
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if file doesn't exist, error code otherwise
  */
 esp_err_t battery_fs_get_entry_count(const char *battery_serial, size_t *count);
+
+/**
+ * @brief Clear all battery log files
+ * 
+ * Deletes all .bin files in the filesystem mount point.
+ * Useful for clearing old test data or resetting the system.
+ * 
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t battery_fs_clear_all_logs(void);
 
 /**
  * @brief Get filesystem information

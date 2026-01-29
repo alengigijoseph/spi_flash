@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <errno.h>
 #include "esp_log.h"
 #include "esp_vfs_fat_nand.h"
@@ -30,6 +31,55 @@ static struct {
 static void build_file_path(const char *battery_serial, char *path, size_t path_size) {
     // Use .bin extension and remove special characters for FAT compatibility
     snprintf(path, path_size, "%s/%s.bin", g_fs_state.mount_point, battery_serial);
+}
+
+/**
+ * @brief Build metadata file path from battery serial number
+ */
+static void build_meta_path(const char *battery_serial, char *path, size_t path_size) {
+    // Use .met extension (3 chars for FAT compatibility)
+    snprintf(path, path_size, "%s/%s.met", g_fs_state.mount_point, battery_serial);
+}
+
+/**
+ * @brief Load last file position from metadata
+ */
+static long load_last_position(const char *battery_serial) {
+    char metapath[128];
+    build_meta_path(battery_serial, metapath, sizeof(metapath));
+    
+    FILE *f = fopen(metapath, "r");
+    if (f == NULL) {
+        ESP_LOGD(TAG, "No metadata file for %s, starting from position 0", battery_serial);
+        return 0;  // No metadata, start from beginning
+    }
+    
+    long position = 0;
+    fscanf(f, "%ld", &position);
+    fclose(f);
+    
+    ESP_LOGI(TAG, "Loaded position %ld from metadata for %s", position, battery_serial);
+    return position;
+}
+
+/**
+ * @brief Save current file position to metadata
+ */
+static void save_last_position(const char *battery_serial, long position) {
+    char metapath[128];
+    build_meta_path(battery_serial, metapath, sizeof(metapath));
+    
+    ESP_LOGI(TAG, "Attempting to save position %ld to %s", position, metapath);
+    
+    FILE *f = fopen(metapath, "w");
+    if (f != NULL) {
+        fprintf(f, "%ld", position);
+        fclose(f);
+        ESP_LOGI(TAG, "✓ Saved position %ld to metadata for %s", position, battery_serial);
+    } else {
+        ESP_LOGE(TAG, "Failed to save metadata to %s (errno: %d - %s)", 
+                 metapath, errno, strerror(errno));
+    }
 }
 
 esp_err_t battery_fs_init(const battery_fs_config_t *config) {
@@ -135,6 +185,62 @@ esp_err_t battery_fs_file_exists(const char *battery_serial, bool *exists) {
     *exists = (stat(filepath, &st) == 0);
 
     return ESP_OK;
+}
+
+esp_err_t battery_fs_clear_all_logs(void) {
+    if (!g_fs_state.initialized) {
+        ESP_LOGE(TAG, "Not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Clearing all battery log files from %s...", g_fs_state.mount_point);
+
+    DIR *dir = opendir(g_fs_state.mount_point);
+    if (dir == NULL) {
+        ESP_LOGE(TAG, "Failed to open directory %s (errno: %d - %s)", 
+                 g_fs_state.mount_point, errno, strerror(errno));
+        return ESP_FAIL;
+    }
+
+    struct dirent *entry;
+    size_t deleted_count = 0;
+    size_t failed_count = 0;
+    size_t total_files = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        total_files++;
+        ESP_LOGI(TAG, "Found file: %s", entry->d_name);
+        
+        // Delete .bin and .meta/.met files (case-insensitive check)
+        const char *ext = strrchr(entry->d_name, '.');
+        if (ext != NULL && (strcasecmp(ext, ".bin") == 0 || 
+                           strcasecmp(ext, ".meta") == 0 || 
+                           strcasecmp(ext, ".met") == 0)) {
+            char filepath[512];
+            int len = snprintf(filepath, sizeof(filepath), "%s/%s", g_fs_state.mount_point, entry->d_name);
+            if (len < 0 || (size_t)len >= sizeof(filepath)) {
+                ESP_LOGE(TAG, "Filepath too long: %s", entry->d_name);
+                failed_count++;
+                continue;
+            }
+            
+            ESP_LOGI(TAG, "Deleting: %s", filepath);
+            if (remove(filepath) == 0) {
+                ESP_LOGI(TAG, "✓ Deleted: %s", entry->d_name);
+                deleted_count++;
+            } else {
+                ESP_LOGE(TAG, "✗ Failed to delete: %s (errno: %d - %s)", 
+                         entry->d_name, errno, strerror(errno));
+                failed_count++;
+            }
+        }
+    }
+
+    closedir(dir);
+
+    ESP_LOGI(TAG, "Directory scan complete: %u total files, %u deleted, %u failed", 
+             total_files, deleted_count, failed_count);
+    return (failed_count == 0) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t battery_fs_write_data(const char *battery_serial, const battery_data_t *data) {
@@ -265,6 +371,179 @@ esp_err_t battery_fs_write_bulk(const char *battery_serial, const battery_data_t
 
     ESP_LOGI(TAG, "Successfully bulk wrote %u/%u entries to %s", written_count, count, battery_serial);
     return (written_count == count) ? ESP_OK : ESP_FAIL;
+}
+
+/**
+ * @brief Calculate CRC32 hash of binary data
+ */
+static uint32_t calculate_crc32(const uint8_t *data, size_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+    
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+        }
+    }
+    
+    return ~crc;
+}
+
+/**
+ * @brief Entry index for fast lookup
+ */
+typedef struct {
+    uint32_t log_number;
+    uint32_t hash;
+    bool valid;
+} entry_index_t;
+
+esp_err_t battery_fs_sync_from_ring(const char *battery_serial, const battery_data_t *data_array, size_t count, size_t *written_count) {
+    if (!g_fs_state.initialized) {
+        ESP_LOGE(TAG, "Not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (battery_serial == NULL || data_array == NULL || count == 0) {
+        ESP_LOGE(TAG, "Invalid arguments");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "Smart sync: Comparing %u entries from ring buffer with flash data", count);
+    uint32_t start_time = esp_log_timestamp();
+
+    // Check if file exists
+    bool file_exists = false;
+    battery_fs_file_exists(battery_serial, &file_exists);
+
+    // Build index of existing entries from flash
+    entry_index_t *flash_index = calloc(count, sizeof(entry_index_t));
+    if (flash_index == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for flash index");
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t flash_entries = 0;
+
+    if (file_exists) {
+        // Read last N entries from flash to build comparison index
+        ESP_LOGI(TAG, "Loading last %u entries from flash for comparison", count);
+        
+        char filepath[128];
+        build_file_path(battery_serial, filepath, sizeof(filepath));
+        
+        FILE *f = fopen(filepath, "r");
+        if (f != NULL) {
+            // Get file size
+            fseek(f, 0, SEEK_END);
+            long file_size = ftell(f);
+            
+            // Estimate position to start reading last N entries
+            // Each entry is ~78 bytes (4+4+70), seek back N*85 with margin
+            long estimated_bytes = count * 85;
+            long start_pos = (file_size > estimated_bytes) ? (file_size - estimated_bytes) : 0;
+            fseek(f, start_pos, SEEK_SET);
+            
+            ESP_LOGI(TAG, "Reading last %u entries from file (size: %ld, seeking from: %ld)", 
+                     count, file_size, start_pos);
+            
+            // Read all entries from this point, keep last N in circular buffer
+            uint8_t *buffer = malloc(4096);
+            if (buffer != NULL) {
+                size_t write_idx = 0;
+                
+                while (ftell(f) < file_size) {
+                    uint32_t log_num, data_len;
+                    
+                    if (fread(&log_num, 1, sizeof(uint32_t), f) != sizeof(uint32_t)) break;
+                    if (fread(&data_len, 1, sizeof(uint32_t), f) != sizeof(uint32_t)) break;
+                    
+                    if (data_len > 0 && data_len <= 4096) {
+                        size_t read_bytes = fread(buffer, 1, data_len, f);
+                        if (read_bytes == data_len) {
+                            // Store in circular buffer - keeps only last N
+                            size_t idx = write_idx % count;
+                            flash_index[idx].log_number = log_num;
+                            flash_index[idx].hash = calculate_crc32(buffer, data_len);
+                            flash_index[idx].valid = true;
+                            write_idx++;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                
+                flash_entries = (write_idx < count) ? write_idx : count;
+                free(buffer);
+            }
+            
+            fclose(f);
+            ESP_LOGI(TAG, "Loaded %u entries from flash for comparison", flash_entries);
+        }
+    } else {
+        ESP_LOGI(TAG, "File doesn't exist - will write all entries");
+    }
+
+    // Compare incoming data against flash index
+    battery_data_t *new_entries = malloc(count * sizeof(battery_data_t));
+    if (new_entries == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for new entries");
+        free(flash_index);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t new_count = 0;
+    size_t duplicates = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        const battery_data_t *incoming = &data_array[i];
+        uint32_t incoming_hash = calculate_crc32(incoming->binary_data, incoming->data_len);
+        bool is_duplicate = false;
+
+        // Check if this entry exists in flash with same hash
+        for (size_t j = 0; j < flash_entries; j++) {
+            if (flash_index[j].valid && 
+                flash_index[j].log_number == incoming->log_number &&
+                flash_index[j].hash == incoming_hash) {
+                is_duplicate = true;
+                duplicates++;
+                break;
+            }
+        }
+
+        // Add to write list if not duplicate
+        if (!is_duplicate) {
+            new_entries[new_count++] = *incoming;
+        }
+    }
+
+    ESP_LOGI(TAG, "Comparison complete: %u new/changed, %u duplicates", new_count, duplicates);
+
+    // Write only new/changed entries using bulk write
+    esp_err_t ret = ESP_OK;
+    if (new_count > 0) {
+        ret = battery_fs_write_bulk(battery_serial, new_entries, new_count);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "✓ Wrote %u new/changed entries", new_count);
+        }
+    } else {
+        ESP_LOGI(TAG, "No new data to write - all entries already exist in flash");
+    }
+
+    uint32_t elapsed = esp_log_timestamp() - start_time;
+    ESP_LOGI(TAG, "Smart sync completed in %lu ms", elapsed);
+
+    // Return written count if requested
+    if (written_count != NULL) {
+        *written_count = new_count;
+    }
+
+    free(new_entries);
+    free(flash_index);
+
+    return ret;
 }
 
 esp_err_t battery_fs_get_last_log(const char *battery_serial, uint32_t *last_log) {

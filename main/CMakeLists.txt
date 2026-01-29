@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c"
-    INCLUDE_DIRS "."
-    REQUIRES battery_fs
+    SRCS "DataAcquisition.c" "main.c"
+    INCLUDE_DIRS "." "include"
+    REQUIRES battery_fs BATMON test_utils
 )
