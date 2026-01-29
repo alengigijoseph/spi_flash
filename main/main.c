@@ -3,7 +3,6 @@
 #include "esp_log.h"
 #include "driver/spi_common.h"
 #include "battery_fs.h"
-#include "battery_tests.h"
 #include "DataAcquisition.h"
 
 static const char *TAG = "MAIN";
@@ -81,7 +80,7 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(500));
         
         // Clear all existing log files
-        battery_fs_clear_all_logs();
+        battery_fs_delete_all();
         ESP_LOGI(TAG, "✓ Cleared existing logs");
     }
 

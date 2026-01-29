@@ -1,5 +1,6 @@
 #include "DataAcquisition.h"
 #include "Batmon_struct.h"
+#include "battery_fs.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
@@ -176,6 +177,65 @@ void SMBUS_update(void *arg)
                 // Battery just connected or reconnected
                 ESP_LOGI(TAG, "\n========== BATMON %d (0x%02X) CONNECTED ==========", i, BATMON_addresses[i]);
                 ESP_LOGI(TAG, "SOC: %d%%", soc);
+                
+                // Get battery serial number (full 128-bit UID)
+                uint16_t sn[8];
+                char serial_full[40];
+                if (BATMON_getSN(&BATMON_handle[i], sn)) {
+                    // Format full serial number as hex string for logging
+                    snprintf(serial_full, sizeof(serial_full), 
+                             "%04X%04X%04X%04X%04X%04X%04X%04X",
+                             sn[0], sn[1], sn[2], sn[3], sn[4], sn[5], sn[6], sn[7]);
+                    ESP_LOGI(TAG, "Battery Serial (128-bit): %s", serial_full);
+                } else {
+                    ESP_LOGW(TAG, "Failed to read battery serial number");
+                    serial_full[0] = '\0';
+                }
+                
+                // Get battery hash (16-bit) for shorter filename
+                uint16_t hash;
+                char filename[16];
+                esp_err_t ret = BATMON_getHash(&BATMON_handle[i], &hash);
+                if (ret == ESP_OK) {
+                    snprintf(filename, sizeof(filename), "BAT_%04X", hash);
+                    ESP_LOGI(TAG, "Battery ID (hash): %s", filename);
+                } else {
+                    // Fallback to address-based filename
+                    snprintf(filename, sizeof(filename), "BAT_%02X", BATMON_addresses[i]);
+                    ESP_LOGW(TAG, "Failed to read hash, using address as ID: %s", filename);
+                }
+                
+                // Get battery memory log
+                BATMON_Mem_Info mem_info;
+                BatmonMemory batmem;
+                
+                ret = BATMON_getMemoryInfo(&BATMON_handle[i], &mem_info);
+                if (ret == ESP_OK) {
+                    bool success = BATMON_getMemory(&BATMON_handle[i], &batmem, &mem_info);
+                    if (success) {
+                        // Prepare battery log for writing
+                        battery_log_t log = {
+                            .memory_index = batmem.data.memoryIndex,
+                            .data = (uint8_t *)&batmem,
+                            .data_len = sizeof(BatmonMemory)
+                        };
+                        
+                        // Write to flash (automatically handles new/existing files)
+                        ret = battery_fs_write_data(filename, &log, 1);
+                        if (ret == ESP_OK) {
+                            ESP_LOGI(TAG, "✓ Battery log saved to flash: %s (index #%lu)", 
+                                     filename, (unsigned long)batmem.data.memoryIndex);
+                        } else {
+                            ESP_LOGE(TAG, "✗ Failed to save battery log to flash: %s", esp_err_to_name(ret));
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "Failed to read battery memory");
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Failed to get memory info: %s", esp_err_to_name(ret));
+                }
+                
+                // Print the log for debugging
                 get_battery_log(i);
                 battery_state[i].is_connected = true;
             }

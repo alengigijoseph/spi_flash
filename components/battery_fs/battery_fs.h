@@ -34,26 +34,28 @@ typedef struct {
 } battery_fs_config_t;
 
 /**
- * @brief Battery data entry structure
+ * @brief Battery memory log entry
  */
 typedef struct {
-    uint32_t log_number;    ///< Log entry number
-    uint8_t *binary_data;   ///< Pointer to binary data
+    uint32_t memory_index;  ///< Memory index from battery
+    uint8_t *data;          ///< Pointer to binary data
     size_t data_len;        ///< Length of binary data
-} battery_data_t;
+} battery_log_t;
 
 /**
- * @brief Callback function for reading battery data
- * 
- * Called for each log entry when reading battery file.
- * 
- * @param log_number The log entry number
- * @param binary_data Pointer to binary data (valid only during callback)
- * @param data_len Length of binary data
- * @param user_ctx User context pointer passed to battery_fs_read_data
- * @return true to continue reading, false to stop
+ * @brief Battery metadata structure
+ * Stores information about the last recorded log
  */
-typedef bool (*battery_data_read_cb_t)(uint32_t log_number, const uint8_t *binary_data, size_t data_len, void *user_ctx);
+typedef struct {
+    uint32_t last_memory_index; ///< Last memory index written
+    uint32_t record_count;      ///< Total number of records
+    uint32_t last_timestamp;    ///< Last update timestamp (optional)
+    uint32_t last_data_hash;    ///< CRC32 hash of last record's data (for ring buffer detection)
+} battery_metadata_t;
+
+// ============================================================================
+// Core Functions
+// ============================================================================
 
 /**
  * @brief Initialize battery filesystem
@@ -64,153 +66,6 @@ typedef bool (*battery_data_read_cb_t)(uint32_t log_number, const uint8_t *binar
 esp_err_t battery_fs_init(const battery_fs_config_t *config);
 
 /**
- * @brief Write battery data to file
- * 
- * Creates a new file if battery serial number doesn't exist,
- * or appends to existing file.
- * 
- * @param battery_serial Battery serial number (will be used as filename)
- * @param data Pointer to battery data structure
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t battery_fs_write_data(const char *battery_serial, const battery_data_t *data);
-
-/**
- * @brief Write multiple battery data entries in one operation (bulk write)
- * 
- * Efficiently writes multiple log entries by opening the file once.
- * Much faster than calling battery_fs_write_data() multiple times.
- * 
- * @param battery_serial Battery serial number (will be used as filename)
- * @param data_array Array of battery data structures
- * @param count Number of entries in the array
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t battery_fs_write_bulk(const char *battery_serial, const battery_data_t *data_array, size_t count);
-
-/**
- * @brief Smart sync: Write only new/changed entries by comparing with existing data
- * 
- * Compares incoming ring buffer data against the last N entries in flash.
- * Only writes entries that don't exist or have changed data (based on CRC32 hash).
- * This prevents duplicate writes and handles ring buffer wraparound automatically.
- * 
- * Process:
- * 1. Loads last N entries from flash (where N = count of incoming data)
- * 2. Compares log_number and CRC32 hash of each incoming entry
- * 3. Writes only new or modified entries
- * 
- * @param battery_serial Battery serial number (will be used as filename)
- * @param data_array Array of battery data structures from ring buffer
- * @param count Number of entries in the array
- * @param written_count Pointer to store number of entries actually written (optional, can be NULL)
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t battery_fs_sync_from_ring(const char *battery_serial, const battery_data_t *data_array, size_t count, size_t *written_count);
-
-/**
- * @brief Check if a battery file exists
- * 
- * @param battery_serial Battery serial number
- * @param exists Pointer to store result (true if exists)
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t battery_fs_file_exists(const char *battery_serial, bool *exists);
-
-/**
- * @brief Get the last log number for a battery
- * 
- * @param battery_serial Battery serial number
- * @param last_log Pointer to store the last log number
- * @return ESP_OK on success, ESP_ERR_NOT_FOUND if file doesn't exist, error code otherwise
- */
-esp_err_t battery_fs_get_last_log(const char *battery_serial, uint32_t *last_log);
-
-/**
- * @brief Read all battery data entries from file
- * 
- * Reads the battery file and calls the callback function for each log entry.
- * The callback receives the log number, binary data pointer, and data length.
- * Binary data pointer is only valid during the callback.
- * 
- * @param battery_serial Battery serial number
- * @param callback Callback function called for each entry
- * @param user_ctx User context pointer passed to callback
- * @return ESP_OK on success, ESP_ERR_NOT_FOUND if file doesn't exist, error code otherwise
- */
-esp_err_t battery_fs_read_data(const char *battery_serial, battery_data_read_cb_t callback, void *user_ctx);
-
-/**
- * @brief Read all battery data into RAM in one operation (bulk read)
- * 
- * Reads all log entries from file into a pre-allocated array.
- * User must provide array with enough space. Use battery_fs_get_entry_count() first.
- * Each entry's binary_data will be allocated with malloc() - caller must free.
- * 
- * @param battery_serial Battery serial number
- * @param data_array Pre-allocated array to store entries
- * @param max_count Maximum number of entries the array can hold
- * @param actual_count Pointer to store actual number of entries read
- * @return ESP_OK on success, ESP_ERR_NOT_FOUND if file doesn't exist, error code otherwise
- */
-esp_err_t battery_fs_read_bulk(const char *battery_serial, battery_data_t *data_array, size_t max_count, size_t *actual_count);
-
-/**
- * @brief Get the number of log entries in a battery file
- * 
- * Useful before calling battery_fs_read_bulk() to allocate the right array size.
- * 
- * @param battery_serial Battery serial number
- * @param count Pointer to store entry count
- * @return ESP_OK on success, ESP_ERR_NOT_FOUND if file doesn't exist, error code otherwise
- */
-esp_err_t battery_fs_get_entry_count(const char *battery_serial, size_t *count);
-
-/**
- * @brief Clear all battery log files
- * 
- * Deletes all .bin files in the filesystem mount point.
- * Useful for clearing old test data or resetting the system.
- * 
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t battery_fs_clear_all_logs(void);
-
-/**
- * @brief Get filesystem information
- * 
- * @param total_kb Pointer to store total space in KB
- * @param free_kb Pointer to store free space in KB
- * @param used_kb Pointer to store used space in KB
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t battery_fs_get_info(uint64_t *total_kb, uint64_t *free_kb, uint64_t *used_kb);
-
-/**
- * @brief Get flash wear leveling statistics
- * 
- * Provides information about bad blocks for monitoring flash health.
- * Bad block count is fast and suitable for routine monitoring.
- * 
- * @param bad_block_count Pointer to store the number of bad blocks
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t battery_fs_get_wear_info(uint32_t *bad_block_count);
-
-/**
- * @brief Get detailed ECC statistics (WARNING: SLOW operation)
- * 
- * Scans all pages to collect ECC error statistics. This operation
- * takes ~5 seconds and should only be used for detailed diagnostics,
- * not routine monitoring.
- * 
- * Displays: Total ECC errors, uncorrectable errors, errors exceeding threshold
- * 
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t battery_fs_get_ecc_stats(void);
-
-/**
  * @brief Deinitialize battery filesystem
  * 
  * Unmounts filesystem and frees resources
@@ -218,6 +73,98 @@ esp_err_t battery_fs_get_ecc_stats(void);
  * @return ESP_OK on success, error code otherwise
  */
 esp_err_t battery_fs_deinit(void);
+
+// ============================================================================
+// Data Write Functions
+// ============================================================================
+
+/**
+ * @brief Write battery data to flash
+ * 
+ * This function handles:
+ * 1. Check if battery file exists
+ * 2. If exists: Read metadata, identify new records, append only new data
+ * 3. If not exists: Create file and write all data
+ * 4. Update metadata after successful write
+ * 
+ * @param serial_number Battery serial number (used as filename)
+ * @param logs Array of battery memory logs
+ * @param log_count Number of logs in the array
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t battery_fs_write_data(const char *serial_number, const battery_log_t *logs, size_t log_count);
+
+// ============================================================================
+// Metadata Functions
+// ============================================================================
+
+/**
+ * @brief Check if battery file exists
+ * 
+ * @param serial_number Battery serial number
+ * @return true if file exists, false otherwise
+ */
+bool battery_fs_exists(const char *serial_number);
+
+/**
+ * @brief Read battery metadata
+ * 
+ * @param serial_number Battery serial number
+ * @param metadata Pointer to store metadata
+ * @return ESP_OK on success, ESP_ERR_NOT_FOUND if file doesn't exist
+ */
+esp_err_t battery_fs_read_metadata(const char *serial_number, battery_metadata_t *metadata);
+
+/**
+ * @brief Write battery metadata
+ * 
+ * @param serial_number Battery serial number
+ * @param metadata Pointer to metadata structure
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t battery_fs_write_metadata(const char *serial_number, const battery_metadata_t *metadata);
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * @brief Identify new records to append
+ * 
+ * Compares incoming logs with existing metadata to determine which records
+ * are new and need to be written.
+ * 
+ * @param metadata Existing battery metadata
+ * @param logs Array of incoming memory logs
+ * @param log_count Number of logs in the array
+ * @param new_logs Output array of new logs (must be pre-allocated)
+ * @param new_count Output: number of new logs identified
+ * @return ESP_OK on success
+ */
+esp_err_t battery_fs_identify_new_records(const battery_metadata_t *metadata, 
+                                          const battery_log_t *logs, 
+                                          size_t log_count,
+                                          battery_log_t *new_logs, 
+                                          size_t *new_count);
+
+// ============================================================================
+// Delete Functions
+// ============================================================================
+
+/**
+ * @brief Delete all battery files (data and metadata)
+ * 
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t battery_fs_delete_all(void);
+
+/**
+ * @brief Delete specific battery data and metadata
+ * 
+ * @param serial_number Battery serial number
+ * @return ESP_OK on success, ESP_ERR_NOT_FOUND if file doesn't exist
+ */
+esp_err_t battery_fs_delete_battery(const char *serial_number);
 
 #ifdef __cplusplus
 }
